@@ -1,0 +1,12 @@
+# 编译生成的文件
+bin/
+obj/
+publish/
+
+# 用户配置和密钥
+config.txt
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
