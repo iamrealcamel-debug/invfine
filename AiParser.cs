@@ -20,7 +20,7 @@ namespace InvoiceSummary
         private static bool _enabled;
 
         // 可选：想给客户内置一个 Key，就把 Key 用 Base64 编码后填到这里；留空 = 由用户自己填写
-        private const string BuiltInKeyBase64 = "";
+        private const string BuiltInKeyBase64 = "c2stMjM1MjRmNGI1NjMwNDQ3ODgyOTJiMzA4NDEzZGYyZDE=";
 
         // 记录 Token 消耗（并发解析时多个工作线程同时累加，用原子操作保证准确）
         private static long _totalPromptTokens;

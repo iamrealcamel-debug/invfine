@@ -10,6 +10,22 @@
     
     <!-- exe 文件在文件夹里的图标 -->
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- 版本号（改这里就会影响文件属性和程序显示） -->
+  <Version>1.4.0</Version>
+  <AssemblyVersion>1.4.0.0</AssemblyVersion>
+  <FileVersion>1.4.0.0</FileVersion>
+
+  <!-- 不把 Git 哈希加到产品版本后面 -->
+  <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  <InformationalVersion>1.4.0</InformationalVersion>
+
+  <!-- 文件属性里显示的信息 -->
+  <Product>差旅费发票汇总工具</Product>
+  <AssemblyTitle>差旅费发票汇总工具</AssemblyTitle>
+  <Description>差旅费发票汇总工具 - 支持 AI 识别与本地正则解析</Description>
+  <Company>你的名字或公司名</Company>
+  <Authors>你的名字</Authors>
+  <Copyright>Copyright © 2026</Copyright>
   </PropertyGroup>
   
   <ItemGroup>
