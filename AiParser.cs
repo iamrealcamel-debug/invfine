@@ -4,6 +4,7 @@ using System.IO;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 namespace InvoiceSummary
 {
@@ -21,9 +22,11 @@ namespace InvoiceSummary
         // 可选：想给客户内置一个 Key，就把 Key 用 Base64 编码后填到这里；留空 = 由用户自己填写
         private const string BuiltInKeyBase64 = "";
 
-        // 记录 Token 消耗
-        public static long TotalPromptTokens { get; private set; } = 0;
-        public static long TotalCompletionTokens { get; private set; } = 0;
+        // 记录 Token 消耗（并发解析时多个工作线程同时累加，用原子操作保证准确）
+        private static long _totalPromptTokens;
+        private static long _totalCompletionTokens;
+        public static long TotalPromptTokens => Volatile.Read(ref _totalPromptTokens);
+        public static long TotalCompletionTokens => Volatile.Read(ref _totalCompletionTokens);
 
         public static bool IsEnabled => _enabled;
 
@@ -97,7 +100,6 @@ namespace InvoiceSummary
             message = "";
             try
             {
-                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
                 var payload = new
                 {
                     model = model,
@@ -111,7 +113,7 @@ namespace InvoiceSummary
                     req.Headers.Add("Authorization", "Bearer " + apiKey);
                 req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
 
-                using var resp = http.SendAsync(req).GetAwaiter().GetResult();
+                using var resp = Http.SendAsync(req).GetAwaiter().GetResult();
                 var body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
 
                 if (!resp.IsSuccessStatusCode)
@@ -229,8 +231,8 @@ namespace InvoiceSummary
 
             if (doc.RootElement.TryGetProperty("usage", out var usage))
             {
-                if (usage.TryGetProperty("prompt_tokens", out var pt)) TotalPromptTokens += pt.GetInt64();
-                if (usage.TryGetProperty("completion_tokens", out var ct)) TotalCompletionTokens += ct.GetInt64();
+                if (usage.TryGetProperty("prompt_tokens", out var pt)) Interlocked.Add(ref _totalPromptTokens, pt.GetInt64());
+                if (usage.TryGetProperty("completion_tokens", out var ct)) Interlocked.Add(ref _totalCompletionTokens, ct.GetInt64());
             }
 
             return ExtractContent(content);

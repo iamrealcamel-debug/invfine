@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Win32;
 
@@ -23,8 +24,13 @@ namespace InvoiceSummary
         /// <summary>本地模型可以不带密钥</summary>
         public bool KeyOptional { get; }
 
+        /// <summary>估算指导价（元 / 每百万 token），仅用于费用预估，非实时计费，请以服务商官方计费为准</summary>
+        public decimal InputCostPerM { get; }
+        public decimal OutputCostPerM { get; }
+
         public AiProviderInfo(string id, string display, string apiBase, string model,
-                              string keyUrl, string hint, bool keyOptional = false)
+                              string keyUrl, string hint, bool keyOptional = false,
+                              decimal inputCostPerM = 0, decimal outputCostPerM = 0)
         {
             Id = id;
             Display = display;
@@ -33,6 +39,8 @@ namespace InvoiceSummary
             KeyUrl = keyUrl;
             Hint = hint;
             KeyOptional = keyOptional;
+            InputCostPerM = inputCostPerM;
+            OutputCostPerM = outputCostPerM;
         }
 
         /// <summary>去掉括号/后缀说明的短名字，用于状态栏</summary>
@@ -56,32 +64,38 @@ namespace InvoiceSummary
         {
             new("deepseek", "DeepSeek 深度求索（推荐）", "https://api.deepseek.com/v1", "deepseek-chat",
                 "https://platform.deepseek.com/api_keys",
-                "deepseek-chat 便宜、中文强，识别发票完全够用；充值后按量计费。"),
+                "deepseek-chat 便宜、中文强，识别发票完全够用；充值后按量计费。",
+                inputCostPerM: 1.0m, outputCostPerM: 2.0m),
 
             new("qwen", "通义千问 · 阿里云百炼", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",
                 "https://bailian.console.aliyun.com/",
-                "百炼控制台 → API-KEY 管理里创建；新用户有免费额度。"),
+                "百炼控制台 → API-KEY 管理里创建；新用户有免费额度。",
+                inputCostPerM: 0.8m, outputCostPerM: 2.0m),
 
             new("kimi", "Kimi · 月之暗面", "https://api.moonshot.cn/v1", "moonshot-v1-8k",
                 "https://platform.moonshot.cn/console/api-keys",
-                "moonshot-v1-8k 单价低、长文本友好，适合一页发票。"),
+                "moonshot-v1-8k 单价低、长文本友好，适合一页发票。",
+                inputCostPerM: 12.0m, outputCostPerM: 12.0m),
 
             new("zhipu", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash",
                 "https://bigmodel.cn/usercenter/apikeys",
-                "glm-4-flash 有免费额度，速度较快。"),
+                "glm-4-flash 有免费额度，速度较快。",
+                inputCostPerM: 0.1m, outputCostPerM: 0.1m),
 
             new("siliconflow", "硅基流动 SiliconFlow", "https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-14B-Instruct",
                 "https://cloud.siliconflow.cn/account/ak",
-                "聚合平台，模型名可换成任意 OpenAI 兼容模型（如 Qwen/Qwen2.5-7B-Instruct）。"),
+                "聚合平台，模型名可换成任意 OpenAI 兼容模型（如 Qwen/Qwen2.5-7B-Instruct）。",
+                inputCostPerM: 0.6m, outputCostPerM: 0.6m),
 
             new("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini",
                 "https://platform.openai.com/api-keys",
-                "国内直连不通，需要自备代理，把上面的接口地址改成中转地址。"),
+                "国内直连不通，需要自备代理，把上面的接口地址改成中转地址。",
+                inputCostPerM: 1.1m, outputCostPerM: 4.3m),
 
             new("custom", "自定义 / 本地模型（OpenAI 兼容）", "http://127.0.0.1:11434/v1", "qwen2.5:7b",
                 "",
                 "可填 vLLM、Ollama、One-API 等地址；本地模型不填密钥也能用（接口地址 + /chat/completions）。",
-                keyOptional: true),
+                keyOptional: true, inputCostPerM: 0m, outputCostPerM: 0m),
         };
 
         public static AiProviderInfo Find(string? id)
@@ -338,19 +352,93 @@ namespace InvoiceSummary
             key.SetValue("saved_at", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), RegistryValueKind.String);
         }
 
-        // 注册表里的密钥存成 b64:xxx，只是不让人一眼看到，不是加密
+        // ---------- 重置 ----------
+        /// <summary>清空本机已保存的 AI 配置（注册表 AI 子键 + config.txt 中的 AI 键），用于重新设置</summary>
+        public static void ClearAll(string baseDir, out List<string> cleared, out List<string> errors)
+        {
+            cleared = new List<string>();
+            errors = new List<string>();
+
+            // 1) 删除注册表 AI 子键
+            try
+            {
+                using var parent = Registry.CurrentUser.OpenSubKey(RegistryPath, writable: true);
+                if (parent != null)
+                {
+                    parent.DeleteSubKeyTree(RegistrySubPath, throwOnMissingSubKey: false);
+                    cleared.Add("注册表");
+                }
+            }
+            catch (Exception ex) { errors.Add("注册表：" + ex.Message); }
+
+            // 2) 从 config.txt 移除 AI 相关键（保留注释和其它行）
+            try
+            {
+                var path = ConfigFile(baseDir);
+                if (!File.Exists(path)) return;
+                var lines = File.ReadAllLines(path);
+                var remove = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "enable_ai","enable","enabled",
+                    "provider","vendor",
+                    "api_base","apibase","base_url","baseurl","endpoint",
+                    "model","model_name",
+                    "api_key","apikey","key","token"
+                };
+                var kept = new List<string>();
+                foreach (var line in lines)
+                {
+                    var t = line.Trim();
+                    int idx = t.IndexOf('=');
+                    bool drop = idx > 0 && remove.Contains(t.Substring(0, idx).Trim().ToLowerInvariant().Replace('-', '_'));
+                    if (!drop) kept.Add(line);
+                }
+                if (kept.Count != lines.Length)
+                {
+                    File.WriteAllLines(path, kept, new UTF8Encoding(false));
+                    cleared.Add("config.txt");
+                }
+            }
+            catch (Exception ex) { errors.Add("config.txt：" + ex.Message); }
+        }
+
+        // 密钥存储：优先用 Windows DPAPI（当前用户）加密为 dp:xxx；旧格式 b64:xxx / 明文仍可读取。
+        // DPAPI 的密文与当前 Windows 用户绑定，换用户/换机器后无法解密（会退回重新填写）。
+        private static readonly byte[] KeyEntropy = Encoding.UTF8.GetBytes("InvoiceTool.AI.v1");
+
         private static string EncodeKey(string key)
-            => string.IsNullOrEmpty(key) ? "" : "b64:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(key));
+        {
+            if (string.IsNullOrEmpty(key)) return "";
+            try
+            {
+                var bytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(key), KeyEntropy, DataProtectionScope.CurrentUser);
+                return "dp:" + Convert.ToBase64String(bytes);
+            }
+            catch
+            {
+                // 兜底：DPAPI 不可用时退回 Base64（仅防一眼看到，不是加密）
+                return "b64:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(key));
+            }
+        }
 
         private static string DecodeKey(string? raw)
         {
             if (string.IsNullOrWhiteSpace(raw)) return "";
+            if (raw.StartsWith("dp:", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var bytes = ProtectedData.Unprotect(Convert.FromBase64String(raw.Substring(3)), KeyEntropy, DataProtectionScope.CurrentUser);
+                    return Encoding.UTF8.GetString(bytes);
+                }
+                catch { return ""; } // 解密失败（换了用户/机器）按无密钥处理
+            }
             if (raw.StartsWith("b64:", StringComparison.OrdinalIgnoreCase))
             {
                 try { return Encoding.UTF8.GetString(Convert.FromBase64String(raw.Substring(4))); }
                 catch { return ""; }
             }
-            return raw.Trim(); // 手工在注册表里填明文也认
+            return raw.Trim(); // 手工填的明文也认
         }
     }
 }

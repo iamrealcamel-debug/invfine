@@ -1,11 +1,13 @@
 // Program.cs
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using PdfSharp.Drawing;
@@ -90,9 +92,10 @@ namespace InvoiceSummary
         private Button? btnBrowse;
         private Button? btnStart;
         private RichTextBox? txtLog;
-        private ProgressBar? progressBar;
+        private ToolStripProgressBar? progressBar;
         private CheckBox? chkShowAiDetail; // 【新增】控制是否显示 AI 交互的复选框
         private Button? btnAiSettings;      // 【新增】打开「AI 设置」窗口
+        private Button? btnResetAi;         // 【新增】重置 AI 配置
         private ToolStripStatusLabel? lblAiStatus; // 【新增】状态栏显示当前 AI
 
         public MainForm() { InitUI(); }
@@ -100,7 +103,7 @@ namespace InvoiceSummary
         private void InitUI()
         {
             Text = "差旅费发票汇总工具 v1.4";
-            Size = new Size(680, 500);
+            Size = new Size(780, 520);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(245, 247, 250);
             Font = new Font("Microsoft YaHei", 9);
@@ -144,18 +147,30 @@ namespace InvoiceSummary
             btnAiSettings = new Button
             {
                 Text = "AI 设置",
-                Location = new Point(320, 9),
-                Width = 84,
+                Location = new Point(318, 9),
+                Width = 76,
                 Height = 28,
                 BackColor = Color.White
             };
             btnAiSettings.Click += BtnAiSettings_Click;
 
+            // 【新增】重置 AI：清空本机已保存的服务商 / 密钥 / 模型，重新引导设置
+            btnResetAi = new Button
+            {
+                Text = "重置 AI",
+                Location = new Point(402, 9),
+                Width = 86,
+                Height = 28,
+                BackColor = Color.FromArgb(250, 240, 240),
+                ForeColor = Color.FromArgb(160, 60, 40)
+            };
+            btnResetAi.Click += BtnResetAi_Click;
+
             // 【新增】AI 交互单选框
             chkShowAiDetail = new CheckBox
             {
                 Text = "显示 AI 交互",
-                Location = new Point(414, 13),
+                Location = new Point(496, 13),
                 AutoSize = true,
                 ForeColor = Color.FromArgb(80, 80, 80),
                 Font = new Font("Microsoft YaHei", 9)
@@ -163,12 +178,10 @@ namespace InvoiceSummary
             // 绑定事件，改变 AiParser 的开关
             chkShowAiDetail.CheckedChanged += (s, e) => AiParser.ShowDebugLog = chkShowAiDetail.Checked;
 
-            progressBar = new ProgressBar { Location = new Point(540, 12), Width = 110, Height = 22, Style = ProgressBarStyle.Continuous, Visible = false };
-
             panelAction.Controls.Add(btnStart);
             panelAction.Controls.Add(btnAiSettings);
+            panelAction.Controls.Add(btnResetAi);
             panelAction.Controls.Add(chkShowAiDetail);
-            panelAction.Controls.Add(progressBar);
 
             txtLog = new RichTextBox
             {
@@ -196,6 +209,15 @@ namespace InvoiceSummary
                 ForeColor = Color.FromArgb(80, 80, 80)
             };
             statusStrip.Items.Add(lblAiStatus);
+
+            // 进度条：使用固定较大宽度，尽量贴近右边（兼容不支持 Spring/MinimumSize 的环境）
+            progressBar = new ToolStripProgressBar
+            {
+                Width = 320,
+                Style = ProgressBarStyle.Continuous,
+                Visible = false
+            };
+            statusStrip.Items.Add(progressBar);
 
             Controls.Add(panelLog);
             Controls.Add(statusStrip);
@@ -245,6 +267,30 @@ namespace InvoiceSummary
         }
 
         private void BtnAiSettings_Click(object? sender, EventArgs e) => ShowAiSetup(firstRun: false);
+
+        /// <summary>重置 AI：清空注册表 + config.txt 里的 AI 配置，再重新引导设置</summary>
+        private void BtnResetAi_Click(object? sender, EventArgs e)
+        {
+            var answer = MessageBox.Show(
+                "将清空本机已保存的 AI 配置（注册表 + config.txt 中的服务商 / 密钥 / 模型），并重新引导设置。\n\n确定继续？",
+                "重置 AI 配置", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (answer != DialogResult.Yes) return;
+
+            var cleared = new List<string>();
+            var errors = new List<string>();
+            AiConfigStore.ClearAll(AppContext.BaseDirectory, out cleared, out errors);
+
+            // 让内存中的 AI 状态同步失效并重读
+            AiParser.Reload(AppContext.BaseDirectory);
+
+            Log("======================================");
+            Log("[AI] 已重置配置" + (cleared.Count > 0 ? "：" + string.Join("、", cleared) : "（未找到已保存的配置）"));
+            if (errors.Count > 0) Log("[AI] 部分清除失败：" + string.Join("；", errors));
+            Log("======================================");
+
+            UpdateAiStatus();
+            ShowAiSetup(firstRun: true);   // 重新引导设置
+        }
 
         private void ShowAiSetup(bool firstRun)
         {
@@ -311,6 +357,7 @@ namespace InvoiceSummary
             btnStart!.Enabled = false;
             btnBrowse!.Enabled = false;
             btnAiSettings!.Enabled = false;
+            btnResetAi!.Enabled = false;
             progressBar!.Visible = true;
 
             // 记录本次运行前的 Token 基数
@@ -340,16 +387,21 @@ namespace InvoiceSummary
                     .ToList();
 
                 Log($"发现 {files.Count} 个 PDF 文件\n");
-                progressBar.Maximum = files.Count;
+                progressBar.Maximum = Math.Max(1, files.Count);
                 progressBar.Value = 0;
 
-                var invoices = new List<Invoice>();
-                var seen = new HashSet<string>();
+                // 线程安全收集与计数（并发解析）
+                var invoices = new ConcurrentBag<Invoice>();
+                var seen = new ConcurrentDictionary<string, byte>();
                 int okCnt = 0, notInvCnt = 0, scannedCnt = 0, lowScoreCnt = 0, multiCnt = 0, errCnt = 0;
+                int completed = 0;
+
+                // 限制并发，避免同时发起过多 AI 请求；以 CPU 数×2 为上限（默认最高 6）
+                int maxConcurrency = Math.Clamp(Environment.ProcessorCount * 2, 1, 6);
 
                 await Task.Run(() =>
                 {
-                    foreach (var f in files)
+                    Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency }, f =>
                     {
                         var name = Path.GetFileName(f);
                         try
@@ -360,15 +412,15 @@ namespace InvoiceSummary
                                 case "ok":
                                     {
                                         var inv = result.Invoice!;
-                                        if (!seen.Add(inv.Number))
+                                        if (!seen.TryAdd(inv.Number, 0))
                                         {
                                             Log($"  - 重复跳过：{name}");
-                                            notInvCnt++;
+                                            Interlocked.Increment(ref notInvCnt);
                                         }
                                         else
                                         {
                                             invoices.Add(inv);
-                                            okCnt++;
+                                            Interlocked.Increment(ref okCnt);
                                             Log($"  ✓ {name}");
                                             Log($"      [{inv.Category}] 发票号 {inv.Number}  开票单位「{inv.SellerName}」");
                                             Log($"      金额 {inv.Amount:0.00}  税额 {inv.Tax:0.00}  价税合计 {inv.Total:0.00}");
@@ -376,40 +428,52 @@ namespace InvoiceSummary
                                         break;
                                     }
                                 case "scanned":
-                                    scannedCnt++;
+                                    Interlocked.Increment(ref scannedCnt);
                                     Log($"  ⚠ {name}  → 疑似扫描件：{result.Message}");
                                     break;
                                 case "multi_number":
-                                    multiCnt++;
+                                    Interlocked.Increment(ref multiCnt);
                                     Log($"  ⚠ {name}  → {result.Message}");
                                     break;
                                 case "low_score":
-                                    lowScoreCnt++;
+                                    Interlocked.Increment(ref lowScoreCnt);
                                     Log($"  - 跳过（特征不足）：{name}  → {result.Message}");
                                     break;
                                 case "not_invoice":
-                                    notInvCnt++;
+                                    Interlocked.Increment(ref notInvCnt);
                                     Log($"  - 跳过（非发票）：{name}");
                                     break;
                                 default:
-                                    errCnt++;
+                                    Interlocked.Increment(ref errCnt);
                                     Log($"  ✗ {name}  → {result.Message}");
                                     break;
                             }
                         }
                         catch (Exception ex)
                         {
-                            errCnt++;
+                            Interlocked.Increment(ref errCnt);
                             Log($"  ✗ {name}  解析失败：{ex.Message}");
                         }
 
-                        Invoke(new Action(() =>
+                        // 进度合并：每 4 张或最后一张刷新一次，减少跨线程切换
+                        int done = Interlocked.Increment(ref completed);
+                        if (done % 4 == 0 || done == files.Count)
                         {
-                            if (progressBar!.Value < progressBar.Maximum)
-                                progressBar.Value++;
-                        }));
-                    }
+                            int snapshot = done;
+                            try
+                            {
+                                BeginInvoke(new Action(() =>
+                                {
+                                    if (progressBar!.Value < progressBar.Maximum)
+                                        progressBar.Value = Math.Min(snapshot, progressBar.Maximum);
+                                }));
+                            }
+                            catch { /* 窗口可能已关闭 */ }
+                        }
+                    });
                 });
+
+                var invoiceList = invoices.ToList();
 
                 Log("\n======================================");
                 Log($"成功：{okCnt}   非发票：{notInvCnt}   扫描件：{scannedCnt}");
@@ -420,7 +484,10 @@ namespace InvoiceSummary
                 long usedCompletionTokens = AiParser.TotalCompletionTokens - startCompletionTokens;
                 long totalUsedTokens = usedPromptTokens + usedCompletionTokens;
 
-                decimal cost = (usedPromptTokens / 1_000_000m * 1.0m) + (usedCompletionTokens / 1_000_000m * 2.0m);
+                // 按服务商估算单价计费（价格见 AiProviderInfo，为参考估算，请以服务商官方计费为准）
+                var price = AiProviders.Find(AiParser.ProviderId);
+                decimal cost = (usedPromptTokens / 1_000_000m * price.InputCostPerM)
+                             + (usedCompletionTokens / 1_000_000m * price.OutputCostPerM);
                 Log("======================================");
                 Log($"[AI 消耗统计]");
                 if (totalUsedTokens == 0)
@@ -436,7 +503,7 @@ namespace InvoiceSummary
                 }
                 Log("======================================");
 
-                if (invoices.Count == 0)
+                if (invoiceList.Count == 0)
                 {
                     Log("没有解析到有效发票，未生成汇总文件。");
                     MessageBox.Show("没有解析到有效发票！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -446,7 +513,7 @@ namespace InvoiceSummary
                 Log("\n正在生成汇总 PDF，请稍候...");
                 string timestamp = DateTime.Now.ToString("HHmmss");
                 string outPath = Path.Combine(dir, $"发票汇总_{timestamp}.pdf");
-                await Task.Run(() => ReportBuilder.Build(outPath, invoices));
+                await Task.Run(() => ReportBuilder.Build(outPath, invoiceList));
 
                 Log($"\n已生成汇总文件：\n{outPath}");
                 Log("处理完成！");
@@ -462,6 +529,7 @@ namespace InvoiceSummary
             }
             finally
             {
+                btnResetAi!.Enabled = true;
                 btnStart.Enabled = true;
                 btnBrowse.Enabled = true;
                 btnAiSettings!.Enabled = true;
