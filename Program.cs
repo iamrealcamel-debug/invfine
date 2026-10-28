@@ -102,7 +102,7 @@ namespace InvoiceSummary
 
         private void InitUI()
         {
-            Text = "差旅费发票汇总工具 v1.4";
+            Text = $"差旅费发票整理汇总工具 v{Application.ProductVersion}";
             Size = new Size(780, 520);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(245, 247, 250);
@@ -374,7 +374,7 @@ namespace InvoiceSummary
                 AiParser.Init(AppContext.BaseDirectory);
 
                 Log("======================================");
-                Log("        发票汇总工具 v1.4 (GUI版)");
+                Log($"        发票整理汇总工具 v{Application.ProductVersion} (GUI版)");
                 Log("======================================");
                 Log($"扫描目录：{dir}");
                 if (!AiParser.IsEnabled)
